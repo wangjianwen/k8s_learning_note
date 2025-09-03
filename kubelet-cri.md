@@ -401,3 +401,6 @@ func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ .
 ```
 
 从上述代码分析可以看出，创建容器实际上是在boltdb中保存一份容器的数据
+
+- 调用cri启动容器
+
