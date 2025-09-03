@@ -1,4 +1,5 @@
 # k8s调用cri创建容器
+kubernetes源码版本是1.28
 ## kubelet源码
 
 kubelet会不断循环SyncPod，其主流程如下：
@@ -72,6 +73,7 @@ func (m *kubeGenericRuntimeManager) startContainer(ctx context.Context, podSandb
 
 这里仅详细分析如何生成容器的配置，因为本人对容器、cgroup之前的底层实现感兴趣。首先看
 - 如何生成容器的配置
+
 代码文件：kuberuntime_container.go
 ```go
 func (m *kubeGenericRuntimeManager) generateContainerConfig(ctx context.Context, container *v1.Container, pod *v1.Pod, restartCount int, podIP, imageRef string, podIPs []string, nsTarget *kubecontainer.ContainerID) (*runtimeapi.ContainerConfig, func(), error) {
@@ -215,6 +217,187 @@ func (m *kubeGenericRuntimeManager) calculateLinuxResources(cpuRequest, cpuLimit
 	... ...
 	return &resources
 }
-
-
 ```
+
+- 调用cri创建容器
+
+首先看客户端实现代码
+
+代码文件：remote_runtime.go
+
+```go
+// CreateContainer creates a new container in the specified PodSandbox.
+func (r *remoteRuntimeService) CreateContainer(ctx context.Context, podSandBoxID string, config *runtimeapi.ContainerConfig, sandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
+	klog.V(10).InfoS("[RemoteRuntimeService] CreateContainer", "podSandboxID", podSandBoxID, "timeout", r.timeout)
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	return r.createContainerV1(ctx, podSandBoxID, config, sandboxConfig)
+}
+
+func (r *remoteRuntimeService) createContainerV1(ctx context.Context, podSandBoxID string, config *runtimeapi.ContainerConfig, sandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
+	// cri grpc 客户端调用服务端containerd
+	resp, err := r.runtimeClient.CreateContainer(ctx, &runtimeapi.CreateContainerRequest{
+		PodSandboxId:  podSandBoxID,
+		Config:        config,
+		SandboxConfig: sandboxConfig,
+	})
+	if err != nil {
+		klog.ErrorS(err, "CreateContainer in sandbox from runtime service failed", "podSandboxID", podSandBoxID)
+		return "", err
+	}
+
+	klog.V(10).InfoS("[RemoteRuntimeService] CreateContainer", "podSandboxID", podSandBoxID, "containerID", resp.ContainerId)
+	if resp.ContainerId == "" {
+		errorMessage := fmt.Sprintf("ContainerId is not set for container %q", config.Metadata)
+		err := errors.New(errorMessage)
+		klog.ErrorS(err, "CreateContainer failed")
+		return "", err
+	}
+
+	return resp.ContainerId, nil
+}
+```
+
+代码文件： api.pb.go
+```go
+func (c *runtimeServiceClient) CreateContainer(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*CreateContainerResponse, error) {
+	out := new(CreateContainerResponse)
+	err := c.cc.Invoke(ctx, "/runtime.v1.RuntimeService/CreateContainer", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+```
+
+再看服务端（cotainerd）实现代码
+本文是基于containerd 1.6 的源代码
+
+代码文件：container_create.go
+
+```go
+// CreateContainer creates a new container in the given PodSandbox.
+func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateContainerRequest) (_ *runtime.CreateContainerResponse, retErr error) {
+	... ...
+	// 获取更底层的运行时，默认是runc
+	ociRuntime, err := c.getSandboxRuntime(sandboxConfig, sandbox.Metadata.RuntimeHandler)
+	... ...
+	// 生成容器规范
+	spec, err := c.containerSpec(id, sandboxID, sandboxPid, sandbox.NetNSPath, containerName, containerdImage.Name(), config, sandboxConfig,
+		&image.ImageSpec.Config, append(mounts, volumeMounts...), ociRuntime)
+
+	... ...
+    runtimeOptions, err := getRuntimeOptions(sandboxInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get runtime options: %w", err)
+	}
+	// 生成创建容器的参数
+	opts = append(opts,
+		containerd.WithSpec(spec, specOpts...),
+		containerd.WithRuntime(sandboxInfo.Runtime.Name, runtimeOptions),
+		containerd.WithContainerLabels(containerLabels),
+		containerd.WithContainerExtension(containerMetadataExtension, &meta))
+	var cntr containerd.Container
+	// 创建
+	if cntr, err = c.client.NewContainer(ctx, id, opts...); err != nil {
+		return nil, fmt.Errorf("failed to create containerd container: %w", err)
+	}
+
+	... ...
+	return &runtime.CreateContainerResponse{ContainerId: id}, nil
+}
+```
+
+再看 NewContainer 的具体实现
+
+代码文件：client.go
+
+```go
+func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContainerOpts) (Container, error) {
+	ctx, done, err := c.WithLease(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done(ctx)
+
+	container := containers.Container{
+		ID: id,
+		Runtime: containers.RuntimeInfo{
+			Name: c.runtime,
+		},
+	}
+	for _, o := range opts {
+		if err := o(ctx, c, &container); err != nil {
+			return nil, err
+		}
+	}
+	r, err := c.ContainerService().Create(ctx, container)
+	if err != nil {
+		return nil, err
+	}
+	return containerFromRecord(c, r), nil
+}
+```
+
+```go
+func (r *remoteContainers) Create(ctx context.Context, container containers.Container) (containers.Container, error) {
+	created, err := r.client.Create(ctx, &containersapi.CreateContainerRequest{
+		Container: containerToProto(&container),
+	})
+	if err != nil {
+		return containers.Container{}, errdefs.FromGRPC(err)
+	}
+
+	return containerFromProto(&created.Container), nil
+
+}
+```
+
+```go
+func (c *containersClient) Create(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*CreateContainerResponse, error) {
+	out := new(CreateContainerResponse)
+	err := c.cc.Invoke(ctx, "/containerd.services.containers.v1.Containers/Create", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+```
+
+最后通过 grpc 调用local ，其服务端实现如下：
+
+```go
+func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ ...grpc.CallOption) (*api.CreateContainerResponse, error) {
+	var resp api.CreateContainerResponse
+	
+	if err := l.withStoreUpdate(ctx, func(ctx context.Context) error {
+		container := containerFromProto(&req.Container)
+
+		created, err := l.Store.Create(ctx, container)
+		if err != nil {
+			return err
+		}
+
+		resp.Container = containerToProto(&created)
+
+		return nil
+	}); err != nil {
+		return &resp, errdefs.ToGRPC(err)
+	}
+	if err := l.publisher.Publish(ctx, "/containers/create", &eventstypes.ContainerCreate{
+		ID:    resp.Container.ID,
+		Image: resp.Container.Image,
+		Runtime: &eventstypes.ContainerCreate_Runtime{
+			Name:    resp.Container.Runtime.Name,
+			Options: resp.Container.Runtime.Options,
+		},
+	}); err != nil {
+		return &resp, err
+	}
+
+	return &resp, nil
+}
+```
+
+从上述代码分析可以看出，创建容器实际上是在boltdb中保存一份容器的数据
