@@ -70,7 +70,7 @@ func (m *kubeGenericRuntimeManager) startContainer(ctx context.Context, podSandb
 
 }
 ```
-
+### 生成容器的配置
 这里仅详细分析如何生成容器的配置，因为本人对容器、cgroup之前的底层实现感兴趣。首先看
 - 如何生成容器的配置
 
@@ -218,10 +218,9 @@ func (m *kubeGenericRuntimeManager) calculateLinuxResources(cpuRequest, cpuLimit
 	return &resources
 }
 ```
+### 创建容器的配置
 
-- 调用cri创建容器
-
-首先看客户端实现代码
+首先看kublet客户端实现代码
 
 代码文件：remote_runtime.go
 
@@ -402,5 +401,339 @@ func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ .
 
 从上述代码分析可以看出，创建容器实际上是在boltdb中保存一份容器的数据
 
-- 调用cri启动容器
+### 调用cri启动容器
+#### 客户端（kubelet)
+首先看kublet客户端的实现，同创建容器代码，基于grpc，调用containerd cri服务端
+
+代码文件：remote_runtime.go
+```go
+func (r *remoteRuntimeService) StartContainer(ctx context.Context, containerID string) (err error) {
+	klog.V(10).InfoS("[RemoteRuntimeService] StartContainer", "containerID", containerID, "timeout", r.timeout)
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	if _, err := r.runtimeClient.StartContainer(ctx, &runtimeapi.StartContainerRequest{
+		ContainerId: containerID,
+	}); err != nil {
+		klog.ErrorS(err, "StartContainer from runtime service failed", "containerID", containerID)
+		return err
+	}
+	klog.V(10).InfoS("[RemoteRuntimeService] StartContainer Response", "containerID", containerID)
+
+	return nil
+}
+```
+代码文件： api.pb.go
+```go
+func (c *runtimeServiceClient) StartContainer(ctx context.Context, in *StartContainerRequest, opts ...grpc.CallOption) (*StartContainerResponse, error) {
+	out := new(StartContainerResponse)
+	err := c.cc.Invoke(ctx, "/runtime.v1.RuntimeService/StartContainer", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+```
+
+#### 服务端（containerd)
+
+代码位置：remote_runtime.go
+
+```go
+func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContainerRequest) (retRes *runtime.StartContainerResponse, retErr error) {
+	// 从使用容器ID从缓存中获取容器的详细信息
+	cntr, err := c.containerStore.Get(r.GetContainerId())
+	info, err := cntr.Container.Info(ctx)
+	id := cntr.ID
+	meta := cntr.Metadata
+	container := cntr.Container
+	config := meta.Config
+	... ...
+	// Get sandbox config from sandbox store.
+	sandbox, err := c.sandboxStore.Get(meta.SandboxID)
+	... ...
+	sandboxID := meta.SandboxID
+	... ...
+    ctrInfo, err := container.Info(ctx)
+	ociRuntime, err := c.getSandboxRuntime(sandbox.Config, sandbox.Metadata.RuntimeHandler)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox runtime: %w", err)
+	}
+
+	taskOpts := c.taskOpts(ctrInfo.Runtime.Name)
+	... ...
+	// 调用 task service
+	task, err := container.NewTask(ctx, ioCreation, taskOpts...)
+}
+```
+container.go
+
+```go
+func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...NewTaskOpts) (_ Task, err error) {
+	... ...
+	request := &tasks.CreateTaskRequest{
+		ContainerID: c.id,
+		Terminal:    cfg.Terminal,
+		Stdin:       cfg.Stdin,
+		Stdout:      cfg.Stdout,
+		Stderr:      cfg.Stderr,
+	}
+	if err != nil {
+		return nil, err
+	}
+	if r.SnapshotKey != "" {
+		if r.Snapshotter == "" {
+			return nil, fmt.Errorf("unable to resolve rootfs mounts without snapshotter on container: %w", errdefs.ErrInvalidArgument)
+		}
+
+		// get the rootfs from the snapshotter and add it to the request
+		s, err := c.client.getSnapshotter(ctx, r.Snapshotter)
+		if err != nil {
+			return nil, err
+		}
+		mounts, err := s.Mounts(ctx, r.SnapshotKey)
+		if err != nil {
+			return nil, err
+		}
+		spec, err := c.Spec(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range mounts {
+			if spec.Linux != nil && spec.Linux.MountLabel != "" {
+				context := label.FormatMountLabel("", spec.Linux.MountLabel)
+				if context != "" {
+					m.Options = append(m.Options, context)
+				}
+			}
+			request.Rootfs = append(request.Rootfs, &types.Mount{
+				Type:    m.Type,
+				Source:  m.Source,
+				Options: m.Options,
+			})
+		}
+	}
+	info := TaskInfo{
+		runtime: r.Runtime.Name,
+	}
+	for _, o := range opts {
+		if err := o(ctx, c.client, &info); err != nil {
+			return nil, err
+		}
+	}
+	if info.RootFS != nil {
+		for _, m := range info.RootFS {
+			request.Rootfs = append(request.Rootfs, &types.Mount{
+				Type:    m.Type,
+				Source:  m.Source,
+				Options: m.Options,
+			})
+		}
+	}
+	request.RuntimePath = info.RuntimePath
+	if info.Options != nil {
+		any, err := typeurl.MarshalAny(info.Options)
+		if err != nil {
+			return nil, err
+		}
+		request.Options = any
+	}
+	t := &task{
+		client: c.client,
+		io:     i,
+		id:     c.id,
+		c:      c,
+	}
+	if info.Checkpoint != nil {
+		request.Checkpoint = info.Checkpoint
+	}
+	// 最终调用
+	response, err := c.client.TaskService().Create(ctx, request)
+	if err != nil {
+		return nil, errdefs.FromGRPC(err)
+	}
+	t.pid = response.Pid
+	return t, nil
+}
+```
+
+```go
+func (c *tasksClient) Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error) {
+	out := new(StartResponse)
+	err := c.cc.Invoke(ctx, "/containerd.services.tasks.v1.Tasks/Start", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+```
+
+在看task的服务端实现
+代码位置：
+
+```go
+func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.CallOption) (*api.CreateTaskResponse, error) {
+	container, err := l.getContainer(ctx, r.ContainerID)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	checkpointPath, err := getRestorePath(container.Runtime.Name, r.Options)
+	if err != nil {
+		return nil, err
+	}
+	... ...
+	opts := runtime.CreateOpts{
+		Spec: container.Spec,
+		IO: runtime.IO{
+			Stdin:    r.Stdin,
+			Stdout:   r.Stdout,
+			Stderr:   r.Stderr,
+			Terminal: r.Terminal,
+		},
+		Checkpoint:     checkpointPath,
+		Runtime:        container.Runtime.Name,
+		RuntimeOptions: container.Runtime.Options,
+		TaskOptions:    r.Options,
+	}
+	if r.RuntimePath != "" {
+		opts.Runtime = r.RuntimePath
+	}
+	for _, m := range r.Rootfs {
+		opts.Rootfs = append(opts.Rootfs, mount.Mount{
+			Type:    m.Type,
+			Source:  m.Source,
+			Options: m.Options,
+		})
+	}
+	l.emitRuntimeWarning(ctx, container.Runtime.Name)
+	rtime, err := l.getRuntime(container.Runtime.Name)
+	if err != nil {
+		return nil, err
+	}
+	_, err = rtime.Get(ctx, r.ContainerID)
+	if err != nil && err != runtime.ErrTaskNotExists {
+		return nil, errdefs.ToGRPC(err)
+	}
+	if err == nil {
+		return nil, errdefs.ToGRPC(fmt.Errorf("task %s: %w", r.ContainerID, errdefs.ErrAlreadyExists))
+	}
+	c, err := rtime.Create(ctx, r.ContainerID, opts)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	labels := map[string]string{"runtime": container.Runtime.Name}
+	if err := l.monitor.Monitor(c, labels); err != nil {
+		return nil, fmt.Errorf("monitor task: %w", err)
+	}
+	pid, err := c.PID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get task pid: %w", err)
+	}
+	return &api.CreateTaskResponse{
+		ContainerID: r.ContainerID,
+		Pid:         pid,
+	}, nil
+}
+```
+
+```go
+func (r *Runtime) Create(ctx context.Context, id string, opts runtime.CreateOpts) (_ runtime.Task, err error) {
+	namespace, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := identifiers.Validate(id); err != nil {
+		return nil, fmt.Errorf("invalid task id: %w", err)
+	}
+
+	ropts, err := r.getRuncOptions(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	bundle, err := newBundle(id,
+		filepath.Join(r.state, namespace),
+		filepath.Join(r.root, namespace),
+		opts.Spec.Value)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			bundle.Delete()
+		}
+	}()
+
+	
+	shimopt := ShimLocal(r.config, r.events)
+	... ... 
+	s, err := bundle.NewShimClient(ctx, namespace, shimopt, ropts)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			deferCtx, deferCancel := context.WithTimeout(
+				namespaces.WithNamespace(context.TODO(), namespace), cleanupTimeout)
+			defer deferCancel()
+			if kerr := s.KillShim(deferCtx); kerr != nil {
+				log.G(ctx).WithError(kerr).Error("failed to kill shim")
+			}
+		}
+	}()
+
+	rt := r.config.Runtime
+	if ropts != nil && ropts.Runtime != "" {
+		rt = ropts.Runtime
+	}
+	sopts := &shim.CreateTaskRequest{
+		ID:         id,
+		Bundle:     bundle.path,
+		Runtime:    rt,
+		Stdin:      opts.IO.Stdin,
+		Stdout:     opts.IO.Stdout,
+		Stderr:     opts.IO.Stderr,
+		Terminal:   opts.IO.Terminal,
+		Checkpoint: opts.Checkpoint,
+		Options:    opts.TaskOptions,
+	}
+	for _, m := range opts.Rootfs {
+		sopts.Rootfs = append(sopts.Rootfs, &types.Mount{
+			Type:    m.Type,
+			Source:  m.Source,
+			Options: m.Options,
+		})
+	}
+	// 调用shim 创建
+	cr, err := s.Create(ctx, sopts)
+	if err != nil {
+		return nil, errdefs.FromGRPC(err)
+	}
+	t, err := newTask(id, namespace, int(cr.Pid), s, r.events, r.tasks, bundle)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.tasks.Add(ctx, t); err != nil {
+		return nil, err
+	}
+	r.events.Publish(ctx, runtime.TaskCreateEventTopic, &eventstypes.TaskCreate{
+		ContainerID: sopts.ID,
+		Bundle:      sopts.Bundle,
+		Rootfs:      sopts.Rootfs,
+		IO: &eventstypes.TaskIO{
+			Stdin:    sopts.Stdin,
+			Stdout:   sopts.Stdout,
+			Stderr:   sopts.Stderr,
+			Terminal: sopts.Terminal,
+		},
+		Checkpoint: sopts.Checkpoint,
+		Pid:        uint32(t.pid),
+	})
+
+	return t, nil
+}
+
+```
+
 
