@@ -600,3 +600,4 @@ scheduler插件默认配置生成包括如下几个过程：
 - 定义好每个profile的registry（插件名称、插件new函数）
 - 根据 registry 定义的插件列表，初始化 pluginsMap（插件名称->使用插件new函数初始化的插件）
 - 根据 profile.Plugins.MultiPoint.Enabled、pluginsMap， 利用反射，生成每个profile的plugins
+- 最后，frameworkImpl对象的字段scorePlugins、filterPlugins、queueSortPlugins、bindPlugins等等值被设置
