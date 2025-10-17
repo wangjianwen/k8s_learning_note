@@ -114,7 +114,7 @@ scheduler组件把pod调度到某1个节点的整个过程分为如下几个阶�
 - ImageLocality
 - ImageLocality
 
-下面是 scheduler初始化插件配置整个过程
+下面是 schedulerprofiles的 plugins.MultiPoint.Enabled 字段整个过程
 
 ```go
 //  
