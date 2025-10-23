@@ -248,3 +248,29 @@ func (f *frameworkImpl) runScorePlugin(ctx context.Context, pl framework.ScorePl
 }
 ```
 
+# BalancedAllocation插件
+
+先看 Score 函数
+
+```go
+// Score invoked at the score extension point.
+func (ba *BalancedAllocation) Score(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) (int64, *fwk.Status) {
+	s, err := getBalancedAllocationPreScoreState(state)
+	if err != nil {
+		s = &balancedAllocationPreScoreState{podRequests: ba.calculatePodResourceRequestList(pod, ba.resources)}
+		if ba.isBestEffortPod(s.podRequests) {
+			return 0, nil
+		}
+	}
+
+	// ba.score favors nodes with balanced resource usage rate.
+	// It calculates the standard deviation for those resources and prioritizes the node based on how close the usage of those resources is to each other.
+	// Detail: score = (1 - std) * MaxNodeScore, where std is calculated by the root square of Σ((fraction(i)-mean)^2)/len(resources)
+	// The algorithm is partly inspired by:
+	// "Wei Huang et al. An Energy Efficient Virtual Machine Placement Algorithm with Balanced Resource Utilization"
+	return ba.score(ctx, pod, nodeInfo, s.podRequests)
+}
+```
+
+
+
